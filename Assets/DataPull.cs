@@ -10,6 +10,12 @@ using TMPro;
 
 public class SteamSalesDiagram : MonoBehaviour
 {
+    public enum Currency
+    {
+        USD,
+        EUR
+    }
+
     [Header("Steam API")]
     public string partnerApiKey = "YOUR_FINANCE_KEY";
     private string lastHighwatermark = "0";
@@ -18,6 +24,7 @@ public class SteamSalesDiagram : MonoBehaviour
     public float margin = 50f;
     public float lineWidth = 3f;
     public bool paused = false;
+    public Currency selectedCurrency = Currency.USD;
 
     [Header("UI Elements")]
     public Slider rangeSlider;
@@ -32,6 +39,8 @@ public class SteamSalesDiagram : MonoBehaviour
     public GameObject loadingScreen;
     public Toggle timezoneToggle;
     public TMP_Text timezoneLabel;
+    public Toggle currencyToggle;
+    public TMP_Text currencyLabel;
     
     [Header("New Revenue Window")]
     public GameObject newRevenueWindow;
@@ -48,6 +57,7 @@ public class SteamSalesDiagram : MonoBehaviour
     private float maxValue = 0f;
     private const string RangePrefKey = "SalesDiagramRange";
     private const string TimezonePrefKey = "UseGermanTime";
+    private const string CurrencyPrefKey = "UseCurrencyEUR";
     private const string LastTotalRevenuePrefKey = "LastTotalRevenue";
 
     // Changed: Use Dictionary to aggregate sales by date
@@ -62,12 +72,34 @@ public class SteamSalesDiagram : MonoBehaviour
     private bool useGermanTime = false;
     private int germanUtcOffsetHours = 1;
     private int usUtcOffsetHours = -5;
+    private float usdToEurRate = 0.92f; // Default rate, will be updated from API
 
     private struct SaleEntry
     {
         public DateTime date;
         public float grossUSD;
         public SaleEntry(DateTime d, float g) { date = d; grossUSD = g; }
+    }
+
+    IEnumerator FetchExchangeRate()
+    {
+        string url = "https://api.exchangerate-api.com/v4/latest/USD";
+        
+        using (UnityWebRequest request = UnityWebRequest.Get(url))
+        {
+            yield return request.SendWebRequest();
+
+            if (request.result == UnityWebRequest.Result.Success)
+            {
+                var json = JSONNode.Parse(request.downloadHandler.text);
+                usdToEurRate = json["rates"]["EUR"].AsFloat;
+                Debug.Log($"Exchange rate updated: 1 USD = {usdToEurRate} EUR");
+            }
+            else
+            {
+                Debug.LogWarning("Failed to fetch exchange rate, using default: " + usdToEurRate);
+            }
+        }
     }
 
     void OnApplicationPause(bool pauseStatus)
@@ -86,10 +118,25 @@ public class SteamSalesDiagram : MonoBehaviour
 
     void Start()
     {   
+        // FORCE REFETCH - UNCOMMENT TO CLEAR ALL DATA:
+        // PlayerPrefs.DeleteAll();
+        // lastHighwatermark = "0";
+        // salesByDate.Clear();
+        // salesEntries.Clear();
+        
         if(!PlayerPrefs.HasKey("SteamPartnerApiKey"))loadingScreen.SetActive(false);
         partnerApiKey = PlayerPrefs.GetString("SteamPartnerApiKey", partnerApiKey);
         rangeCount = PlayerPrefs.GetInt(RangePrefKey, 0);
         useGermanTime = PlayerPrefs.GetInt(TimezonePrefKey, 0) == 1;
+        selectedCurrency = PlayerPrefs.GetInt(CurrencyPrefKey, 0) == 1 ? Currency.EUR : Currency.USD;
+        
+        // FORCE FULL REFETCH - DELETE THIS AFTER ONE RUN
+        lastHighwatermark = "0";
+        salesByDate.Clear();
+        salesEntries.Clear();
+        maxValue = 0f;
+        datesFetched = 0;
+        dataReady = false;
 
         // Hide new revenue window initially
         if (newRevenueWindow)
@@ -123,6 +170,14 @@ public class SteamSalesDiagram : MonoBehaviour
             UpdateTimezoneLabel();
         }
 
+        if (currencyToggle)
+        {
+            currencyToggle.isOn = (selectedCurrency == Currency.EUR);
+            currencyToggle.onValueChanged.AddListener(OnCurrencyToggled);
+            UpdateCurrencyLabel();
+        }
+
+        StartCoroutine(FetchExchangeRate());
         StartCoroutine(FetchChangedDates());
     }
 
@@ -144,10 +199,39 @@ public class SteamSalesDiagram : MonoBehaviour
         }
     }
 
+    void OnCurrencyToggled(bool isOn)
+    {
+        selectedCurrency = isOn ? Currency.EUR : Currency.USD;
+        PlayerPrefs.SetInt(CurrencyPrefKey, isOn ? 1 : 0);
+        PlayerPrefs.Save();
+        UpdateCurrencyLabel();
+        
+        // Fetch latest exchange rate when switching to EUR
+        if (isOn)
+        {
+            StartCoroutine(FetchExchangeRate());
+        }
+        
+        UpdateRevenueTexts();
+    }
+
+    void UpdateCurrencyLabel()
+    {
+        if (currencyLabel)
+        {
+            currencyLabel.text = selectedCurrency == Currency.EUR ? "EUR" : "USD";
+        }
+    }
+
     DateTime GetLocalTime(DateTime utcTime)
     {
         int offsetHours = useGermanTime ? germanUtcOffsetHours : usUtcOffsetHours;
         return utcTime.AddHours(offsetHours);
+    }
+
+    float ConvertToDisplayCurrency(float usdAmount)
+    {
+        return selectedCurrency == Currency.EUR ? usdAmount * usdToEurRate : usdAmount;
     }
 
     IEnumerator FetchChangedDates()
@@ -201,11 +285,11 @@ public class SteamSalesDiagram : MonoBehaviour
                 {
                     var salesJson = JSONNode.Parse(request.downloadHandler.text);
 
-                    // Aggregate all sales for this date
+                    // Just use net_sales_usd from Steam API
                     foreach (JSONNode sale in salesJson["response"]["results"].AsArray)
                     {
-                        float grossUSD = sale["gross_sales_usd"].AsFloat;
-                        dailyTotal += grossUSD;
+                        float netRevenue = sale["net_sales_usd"].AsFloat;
+                        dailyTotal += netRevenue;
                     }
 
                     ulong maxId = ulong.Parse(salesJson["response"]["max_id"]);
@@ -238,12 +322,19 @@ public class SteamSalesDiagram : MonoBehaviour
 
         if (datesFetched >= datesToFetch)
         {
-            // Ensure today exists in the data (even if $0)
-            DateTime todayUtc = DateTime.UtcNow.Date;
-            if (!salesByDate.ContainsKey(todayUtc))
+            // Fill in missing dates with $0 revenue
+            FillMissingDates();
+
+            // Recalculate maxValue from all data
+            maxValue = 0f;
+            foreach (var kvp in salesByDate)
             {
-                salesByDate[todayUtc] = 0f;
+                if (kvp.Value > maxValue) 
+                    maxValue = kvp.Value;
             }
+            
+            // Ensure maxValue is never zero to prevent division by zero
+            if (maxValue < 0.01f) maxValue = 1f;
 
             // Convert dictionary to sorted list
             salesEntries = salesByDate
@@ -260,6 +351,24 @@ public class SteamSalesDiagram : MonoBehaviour
             dataReady = true;
             UpdateRevenueTexts();
             CheckForNewRevenue();
+        }
+    }
+
+    void FillMissingDates()
+    {
+        if (salesByDate.Count == 0) return;
+
+        // Get date range
+        DateTime minDate = salesByDate.Keys.Min();
+        DateTime maxDate = DateTime.UtcNow.Date; // Include today
+
+        // Fill in all dates from min to max
+        for (DateTime date = minDate; date <= maxDate; date = date.AddDays(1))
+        {
+            if (!salesByDate.ContainsKey(date))
+            {
+                salesByDate[date] = 0f;
+            }
         }
     }
 
@@ -282,11 +391,11 @@ public class SteamSalesDiagram : MonoBehaviour
             return;
         }
 
-        // Calculate new revenue
+        // Calculate new revenue (can be negative if there were refunds)
         float newRevenue = currentTotalRevenue - lastTotalRevenue;
 
-        // If there's new revenue, show the window
-        if (newRevenue > 0.01f)
+        // Show window for any change (positive or negative)
+        if (Mathf.Abs(newRevenue) > 0.01f)
         {
             ShowNewRevenueWindow(newRevenue);
         }
@@ -302,7 +411,11 @@ public class SteamSalesDiagram : MonoBehaviour
         if (newRevenueWindow && newRevenueAmountText)
         {
             newRevenueWindow.SetActive(true);
-            newRevenueAmountText.text = $"New Revenue!\n<color=#00FF00>+${amount:F2}</color>";
+            string currencySymbol = selectedCurrency == Currency.EUR ? "€" : "$";
+            float displayAmount = ConvertToDisplayCurrency(amount);
+            string color = amount >= 0 ? "#00FF00" : "#FF0000"; // Green for positive, red for negative
+            string prefix = amount >= 0 ? "+" : "";
+            newRevenueAmountText.text = $"New Revenue!\n<color={color}>{prefix}{currencySymbol}{displayAmount:F2}</color>";
         }
     }
 
@@ -370,8 +483,10 @@ public class SteamSalesDiagram : MonoBehaviour
             Color color = currentValue >= previousValue ? Color.green : Color.red;
             DrawLine(previousPoint, currentPoint, color, lineWidth);
 
-            float displayValue = Mathf.Max(currentValue, 0.01f);
-            string revenueText = displayValue <= 0.01f ? "" : $"${displayValue:F2}";
+            string currencySymbol = selectedCurrency == Currency.EUR ? "€" : "$";
+            float displayValue = ConvertToDisplayCurrency(currentValue);
+            float displayValueClamped = Mathf.Max(displayValue, 0.01f);
+            string revenueText = displayValueClamped <= 0.01f ? "" : $"{currencySymbol}{displayValue:F2}";
             Vector2 labelSize = GUI.skin.label.CalcSize(new GUIContent(revenueText));
             GUI.Label(new Rect(currentPoint.x - labelSize.x / 2, currentPoint.y - 20, labelSize.x, labelSize.y), revenueText, labelStyle);
 
@@ -389,6 +504,14 @@ public class SteamSalesDiagram : MonoBehaviour
 
         float angle = Mathf.Atan2(pointB.y - pointA.y, pointB.x - pointA.x) * Mathf.Rad2Deg;
         float length = Vector2.Distance(pointA, pointB);
+
+        // Safety check: prevent NaN values
+        if (float.IsNaN(angle) || float.IsNaN(length) || float.IsInfinity(angle) || float.IsInfinity(length))
+        {
+            GUI.matrix = matrix;
+            GUI.color = savedColor;
+            return;
+        }
 
         GUI.color = color;
         GUIUtility.RotateAroundPivot(angle, pointA);
@@ -449,13 +572,15 @@ public class SteamSalesDiagram : MonoBehaviour
                 selectedRevenue += entry.grossUSD;
         }
 
-        if (revenueSelectedText) revenueSelectedText.text = $"Selected: ${selectedRevenue:F2}";
-        if(additionalInfoText) additionalInfoText.text = $"Today: ${todayRevenue:F2}";
-        if (revenueTodayText) revenueTodayText.text = $"Today: ${todayRevenue:F2}";
-        if (revenueWeekText) revenueWeekText.text = $"This Week: ${weekRevenue:F2}";
-        if (revenueMonthText) revenueMonthText.text = $"30 Days: ${monthRevenue:F2}";
-        if (revenueYearText) revenueYearText.text = $"This Year: ${yearRevenue:F2}";
+        string currencySymbol = selectedCurrency == Currency.EUR ? "€" : "$";
+        
+        if (revenueSelectedText) revenueSelectedText.text = $"Selected: {currencySymbol}{ConvertToDisplayCurrency(selectedRevenue):F2}";
+        if(additionalInfoText) additionalInfoText.text = $"Today: {currencySymbol}{ConvertToDisplayCurrency(todayRevenue):F2}";
+        if (revenueTodayText) revenueTodayText.text = $"Today: {currencySymbol}{ConvertToDisplayCurrency(todayRevenue):F2}";
+        if (revenueWeekText) revenueWeekText.text = $"This Week: {currencySymbol}{ConvertToDisplayCurrency(weekRevenue):F2}";
+        if (revenueMonthText) revenueMonthText.text = $"30 Days: {currencySymbol}{ConvertToDisplayCurrency(monthRevenue):F2}";
+        if (revenueYearText) revenueYearText.text = $"This Year: {currencySymbol}{ConvertToDisplayCurrency(yearRevenue):F2}";
         if (revenueTotalText) 
-            revenueTotalText.text = $"Total: <color=#00FF00>${totalRevenue:F2}</color>";
+            revenueTotalText.text = $"Total: <color=#00FF00>{currencySymbol}{ConvertToDisplayCurrency(totalRevenue):F2}</color>";
     }
 }
