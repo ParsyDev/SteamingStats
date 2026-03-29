@@ -35,6 +35,7 @@ public class SteamSalesDiagram : MonoBehaviour
     public TMP_Text revenueMonthText;
     public TMP_Text revenueYearText;
     public TMP_Text revenueTotalText;
+    public TMP_Text revenueCleanTotal;
     public TMP_Text additionalInfoText;
     public GameObject loadingScreen;
     public Toggle timezoneToggle;
@@ -415,6 +416,7 @@ public class SteamSalesDiagram : MonoBehaviour
             float displayAmount = ConvertToDisplayCurrency(amount);
             string color = amount >= 0 ? "#00FF00" : "#FF0000"; // Green for positive, red for negative
             string prefix = amount >= 0 ? "+" : "";
+            if(displayAmount > 0.001f) displayAmount = displayAmount * 0.7f; // Show estimated payment amount (70% of revenue)
             newRevenueAmountText.text = $"New Revenue!\n<color={color}>{prefix}{currencySymbol}{displayAmount:F2}</color>";
         }
     }
@@ -581,6 +583,8 @@ public class SteamSalesDiagram : MonoBehaviour
         if (revenueMonthText) revenueMonthText.text = $"30 Days: {currencySymbol}{ConvertToDisplayCurrency(monthRevenue):F2}";
         if (revenueYearText) revenueYearText.text = $"This Year: {currencySymbol}{ConvertToDisplayCurrency(yearRevenue):F2}";
         if (revenueTotalText) 
-            revenueTotalText.text = $"Total: <color=#00FF00>{currencySymbol}{ConvertToDisplayCurrency(totalRevenue):F2}</color>";
+            revenueTotalText.text = $"Total: {currencySymbol}{ConvertToDisplayCurrency(totalRevenue):F2}";
+        if (revenueCleanTotal)
+            revenueCleanTotal.text = $"Payment: <color=#00FF00>{currencySymbol}{ConvertToDisplayCurrency(totalRevenue * 0.7f):F2}</color>";
     }
 }
